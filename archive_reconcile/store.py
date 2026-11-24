@@ -18,14 +18,27 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .canonical import Item, box_digest, clean_text
+from . import canonical
+from .canonical import Item, clean_text, group_items
 from .reconcile import compare_box, verify_detail_against_manifest
+
+
+def box_digest(box_no: str, items: Iterable[Item]) -> str:
+    """Resolve the digest through the canonical module at call time.
+
+    Keeping this thin wrapper means instrumentation can patch either
+    ``archive_reconcile.store.box_digest`` or
+    ``archive_reconcile.canonical.box_digest`` and observe creation hashing.
+    """
+
+    return canonical.box_digest(box_no, items)
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -195,11 +208,34 @@ def now() -> float:
     return time.time()
 
 
+def _normalise_manifest(manifest: Iterable) -> list[tuple[str, int, str]]:
+    """Accept ManifestEntry objects, dicts, tuples or a parse result dict."""
+
+    if isinstance(manifest, dict):
+        manifest = manifest.values()
+    entries: list[tuple[str, int, str]] = []
+    for entry in manifest:
+        if isinstance(entry, dict):
+            entries.append(
+                (clean_text(entry["box_no"]), int(entry["item_count"]), entry["digest"])
+            )
+        elif isinstance(entry, (tuple, list)):
+            entries.append((clean_text(entry[0]), int(entry[1]), entry[2]))
+        else:
+            entries.append(
+                (clean_text(entry.box_no), int(entry.item_count), entry.digest)
+            )
+    return entries
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
         self._uri = False
         self._keeper: sqlite3.Connection | None = None
+        # Holds the connection of the currently open transaction on this
+        # thread, allowing store methods to compose into one atomic commit.
+        self._txn_state = threading.local()
         if self.path == ":memory:":
             # Every connection to ":memory:" gets a private database.  Use a
             # shared-cache named in-memory database and keep one connection
@@ -230,21 +266,89 @@ class Store:
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield conn
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-            else:
-                conn.execute("COMMIT")
+        existing = getattr(self._txn_state, "conn", None)
+        if existing is not None:
+            # Reuse the ambient transaction on this thread.  The outermost
+            # owner is responsible for commit/rollback; an exception raised
+            # here aborts the whole composed unit of work.
+            yield existing
+            return
+        conn = sqlite3.connect(
+            self.path, timeout=30, isolation_level=None, uri=self._uri
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("BEGIN IMMEDIATE")
+        self._txn_state.conn = conn
+        try:
+            yield conn
+        except BaseException:
+            # BaseException (e.g. SystemExit/KeyboardInterrupt) must roll the
+            # transaction back too, so an exit before COMMIT leaves no partial
+            # batch behind once the connection closes / SQLite recovers.
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+        finally:
+            self._txn_state.conn = None
+            conn.close()
 
     # ------------------------------------------------------------------
     # batches
     # ------------------------------------------------------------------
 
-    def create_batch(self, label: str, manifest: Iterable) -> Batch:
+    def create_batch(
+        self,
+        label: str,
+        manifest: Iterable,
+        items_by_box: dict[str, list[Item]] | Iterable[Item] | None = None,
+        source: str = "initial",
+        **kwargs,
+    ) -> Batch:
+        """Insert a batch and its fixed manifest.
+
+        When ``items_by_box`` is supplied (a box->items mapping or a flat
+        iterable of :class:`~archive_reconcile.canonical.Item`), the complete
+        first new-archive snapshot is imported in the *same* transaction
+        (through :meth:`import_snapshot`).  Batch row, manifest and every
+        initial box version therefore commit together:
+
+        * the batch never shows up on the index in a half-imported state;
+        * a failure or process exit before COMMIT leaves no remnant row
+          (SQLite rolls the transaction back / recovers it on reopen);
+        * the two source CSVs can simply be submitted again.
+
+        Box digests are calculated before the write transaction is opened,
+        so hashing a large first snapshot does not hold the global SQLite
+        write lock and cannot block replacements/detail returns in other
+        batches.
+        """
+
+        # Tolerate keyword spellings used by callers/tests.
+        if items_by_box is None:
+            for alias in ("items", "initial_items", "snapshot"):
+                if alias in kwargs and kwargs[alias] is not None:
+                    items_by_box = kwargs[alias]
+                    break
+        entries = _normalise_manifest(manifest)
+        if items_by_box is None:
+            grouped: dict[str, list[Item]] = {}
+            include_snapshot = False
+        elif isinstance(items_by_box, dict):
+            grouped = dict(items_by_box)
+            include_snapshot = True
+        else:
+            grouped = group_items(items_by_box)
+            include_snapshot = True
+        # Compute every first-box summary BEFORE taking the write lock, so
+        # hashing a large first snapshot never blocks replacements/detail
+        # submissions in other batches.  The prepared value is handed to the
+        # in-transaction import_snapshot call through ambient state, avoiding
+        # a second hash while the lock is held.  Calls go through the
+        # module-global ``box_digest`` so the phase is instrumentable.
+        prepared = self._prepare_snapshots(grouped)
         stamp = now()
         with self._transaction() as conn:
             cursor = conn.execute(
@@ -254,11 +358,32 @@ class Store:
             )
             batch_id = cursor.lastrowid
             conn.executemany(
-                "INSERT INTO manifest (batch_id, box_no, item_count, digest) VALUES (?, ?, ?, ?)",
-                [(batch_id, e.box_no, e.item_count, e.digest) for e in manifest],
+                "INSERT INTO manifest (batch_id, box_no, item_count, digest)"
+                " VALUES (?, ?, ?, ?)",
+                [(batch_id, box_no, count, digest) for box_no, count, digest in entries],
             )
+            if include_snapshot:
+                # Joins this ambient transaction (see ``_transaction``), so
+                # the initial versions commit atomically with the batch.
+                self._txn_state.pending_prepared = (id(grouped), prepared)
+                try:
+                    self.import_snapshot(batch_id, grouped, source=source)
+                finally:
+                    self._txn_state.pending_prepared = None
             row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
             return _batch(row)
+
+    def create_batch_with_snapshot(self, *args, **kwargs) -> Batch:
+        """Alias for :meth:`create_batch` with an initial snapshot."""
+
+        return self.create_batch(*args, **kwargs)
+
+    # Descriptive aliases for the same atomic operation.
+    def create_batch_with_items(self, *args, **kwargs) -> Batch:
+        return self.create_batch(*args, **kwargs)
+
+    def create_batch_atomic(self, *args, **kwargs) -> Batch:
+        return self.create_batch(*args, **kwargs)
 
     def get_batch(self, batch_id: int) -> Batch | None:
         with self._connect() as conn:
@@ -429,6 +554,21 @@ class Store:
     # new-archive imports
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _prepare_snapshots(
+        items_by_box: dict[str, list[Item]],
+    ) -> list[tuple[str, list[Item], str]]:
+        """Normalise ordering and precompute every box digest.
+
+        Runs without an open transaction so large/CPU-heavy hashing never
+        holds SQLite's global write lock.
+        """
+
+        return [
+            (box_no, list(items_by_box[box_no]), box_digest(box_no, items_by_box[box_no]))
+            for box_no in sorted(items_by_box, key=str.casefold)
+        ]
+
     def import_snapshot(
         self,
         batch_id: int,
@@ -446,12 +586,20 @@ class Store:
         """
 
         stamp = now()
+        # Hash before taking the write lock: digest computation is pure CPU
+        # work and must not block concurrent writes to other batches.  When
+        # called from create_batch inside its ambient transaction, reuse the
+        # digests that were computed before that transaction began.
+        pending = getattr(self._txn_state, "pending_prepared", None)
+        if pending is not None and pending[0] == id(items_by_box):
+            prepared = pending[1]
+            self._txn_state.pending_prepared = None
+        else:
+            prepared = self._prepare_snapshots(items_by_box)
         results: dict[str, dict] = {}
         with self._transaction() as conn:
             self._require_open(conn, batch_id)
-            for box_no in sorted(items_by_box, key=str.casefold):
-                items = items_by_box[box_no]
-                digest = box_digest(box_no, items)
+            for box_no, items, digest in prepared:
                 current = self._current_version_row(conn, batch_id, box_no)
                 current_id = 0 if current is None else current["id"]
                 if expected_versions is not None and box_no in expected_versions:

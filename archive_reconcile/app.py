@@ -132,13 +132,18 @@ def create_app(test_config: dict | None = None) -> Flask:
                 label=label,
             ), 400
 
-        batch = get_store().create_batch(label, manifest.values())
+        # Parsing/validation is finished.  create_batch_with_snapshot first
+        # computes the box digests without a write lock, then commits batch +
+        # manifest + the complete first snapshot in one transaction.  Until
+        # that commit there is no visible batch; a failure or an exit before
+        # COMMIT leaves nothing behind, so both CSVs can be resubmitted.
         grouped = group_items(items)
-        try:
-            get_store().import_snapshot(batch.id, grouped, source="initial")
-        except Exception:
-            get_store().delete_batch(batch.id)
-            raise
+        batch = get_store().create_batch_with_snapshot(
+            label,
+            list(manifest.values()),
+            grouped,
+            source="initial",
+        )
         empty_boxes = sum(1 for box_no in manifest if box_no not in grouped)
         flash(
             f"已建立批次 #{batch.id}：旧库清单 {len(manifest)} 盒，"
@@ -476,6 +481,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return render_template("error.html", message="未找到该批次或盒。"), 404
+
+    @app.errorhandler(500)
+    def internal_error(_error):
+        # In TESTING/DEBUG Flask re-raises before reaching this handler; under
+        # gunicorn this renders a page explaining that no half batch remains.
+        return (
+            render_template(
+                "error.html",
+                message=(
+                    "批次入库失败，本次建立已整体回滚，没有留下残批；"
+                    "请刷新首页后用原来的两份 CSV 重新提交。"
+                ),
+            ),
+            500,
+        )
 
     return app
 
